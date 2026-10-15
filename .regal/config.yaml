@@ -1,0 +1,17 @@
+rules:
+  idiomatic:
+    directory-package-mismatch:
+      # Packages are yata.rules.<rule ID> and yata.lib.<name>.<topic>, which
+      # include a prefix that is not part of the directory path (by design).
+      level: ignore
+  style:
+    opa-fmt:
+      # Formatting is checked by `opa fmt --list --fail` in CI.
+      level: ignore
+    line-length:
+      # Metadata strings (description, remediation) can be long.
+      level: warning
+capabilities:
+  from:
+    engine: opa
+    version: v1.2.0

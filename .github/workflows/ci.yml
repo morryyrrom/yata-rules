@@ -1,0 +1,220 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # labeled / unlabeled re-run the changelog check when `skip-changelog` changes.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_call:
+    inputs:
+      yata-mode:
+        description: "`ci` allows a yata built from YATA_CLI_REF; `release` requires released yata binaries."
+        type: string
+        default: ci
+
+permissions:
+  contents: read
+
+env:
+  # Empty, or the full SHA of a yata-cli commit. When set, CI builds yata from that commit.
+  # Must be empty in release pull requests.
+  YATA_CLI_REF: 12f0a093082a5584e4d3e9e215a13c1d8367e1e3
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Look for Rego files
+        id: rego
+        run: |
+          if [ -n "$(find . -path './.*' -prune -o -type f -name '*.rego' -print -quit)" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No .rego files; skipping opa fmt and Regal."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: open-policy-agent/setup-opa@b2b258e089860efaadaaf71bf6e3aecb4a3eeff1 # v2.4.0
+        if: steps.rego.outputs.found == 'true'
+        with:
+          version: 1.21.2
+      - name: Check formatting
+        if: steps.rego.outputs.found == 'true'
+        run: opa fmt --list --fail .
+      - uses: open-policy-agent/setup-regal@761188c3b435761fa254beca508a44875619648f # v2.0.0
+        if: steps.rego.outputs.found == 'true'
+        with:
+          version: 0.43.0
+      - name: Lint
+        if: steps.rego.outputs.found == 'true'
+        run: regal lint --format github .
+
+  changelog:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check fragment format
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          status=0
+          while IFS= read -r file; do
+            [ "$file" = "changelog.d/README.md" ] && continue
+            name="${file#changelog.d/}"
+            if ! printf '%s\n' "$name" | grep -Eq '^([0-9]+-)?[a-z0-9]+(-[a-z0-9]+)*\.md$'; then
+              echo "::error file=$file::Fragment name must match ^([0-9]+-)?[a-z0-9]+(-[a-z0-9]+)*\.md\$."
+              status=1
+            fi
+            # Each heading must be an allowed `###` section followed by at least one `- ` bullet.
+            if ! awk -v file="$file" '
+              function close_section() {
+                if (section != "" && bullets == 0) {
+                  printf "::error file=%s::Section \"%s\" has no \"- \" bullet.\n", file, section
+                  bad = 1
+                }
+              }
+              /^#/ {
+                close_section()
+                if ($0 ~ /^### (Added|Changed|Deprecated|Removed|Fixed|Security)[[:space:]]*$/) {
+                  section = $0; bullets = 0; sections++
+                } else {
+                  printf "::error file=%s,line=%d::Heading not allowed: %s\n", file, NR, $0
+                  bad = 1; section = ""
+                }
+                next
+              }
+              /^- / {
+                if (section == "") {
+                  printf "::error file=%s,line=%d::Bullet outside an allowed section.\n", file, NR
+                  bad = 1
+                }
+                bullets++
+              }
+              END {
+                close_section()
+                if (sections == 0) {
+                  printf "::error file=%s::Fragment has no section heading.\n", file
+                  bad = 1
+                }
+                exit bad
+              }
+            ' "$file"; then
+              status=1
+            fi
+          done < <(git diff --name-only --no-renames --diff-filter=AM "$BASE_SHA...$HEAD_SHA" -- 'changelog.d/*.md')
+          exit "$status"
+      - name: Check that a fragment exists when needed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SKIP_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'skip-changelog') }}
+        run: |
+          changed="$(git diff --name-only --no-renames "$BASE_SHA...$HEAD_SHA")"
+          if [ "$SKIP_LABEL" = "true" ]; then
+            echo "::notice::Label skip-changelog is set; no fragment required."
+            exit 0
+          fi
+          if printf '%s\n' "$changed" | grep -qx 'CHANGELOG.md'; then
+            echo "::notice::CHANGELOG.md is changed (release pull request); no fragment required."
+            exit 0
+          fi
+          needs="$(printf '%s\n' "$changed" | grep -E '(\.rego$|^yata-policies\.json$)' | grep -Ev '^(lib/|\.)' || true)"
+          if [ -z "$needs" ]; then
+            echo "No rule or manifest changes; no fragment required."
+            exit 0
+          fi
+          fragments="$(git diff --name-only --no-renames --diff-filter=AM "$BASE_SHA...$HEAD_SHA" -- 'changelog.d/*.md' | grep -vx 'changelog.d/README.md' || true)"
+          if [ -z "$fragments" ]; then
+            echo "Files that need a changelog fragment:"
+            printf '  %s\n' $needs
+            echo "::error::Add a fragment to changelog.d/ (see changelog.d/README.md), or ask a maintainer for the skip-changelog label."
+            exit 1
+          fi
+          echo "Fragments: $fragments"
+
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      targets: ${{ steps.plan.outputs.targets }}
+    steps:
+      - name: Choose yata versions
+        id: plan
+        env:
+          YATA_MODE: ${{ inputs.yata-mode || 'ci' }}
+        run: |
+          if [ -n "$YATA_CLI_REF" ]; then
+            if [ "$YATA_MODE" = "release" ]; then
+              echo "::error::YATA_CLI_REF must be empty for a release; releases are tested with released yata binaries."
+              exit 1
+            fi
+            if ! printf '%s\n' "$YATA_CLI_REF" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::YATA_CLI_REF must be a full 40-character commit SHA."
+              exit 1
+            fi
+            echo "targets=[{\"ref\":\"$YATA_CLI_REF\"}]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Released binaries (min_yata_version and the latest release) are not supported yet:
+          # the yata-cli release layout is undecided. Fail instead of passing without running yata.
+          echo "::error::There is no path for yata-cli release binaries yet. Set YATA_CLI_REF in .github/workflows/ci.yml."
+          exit 1
+
+  rules-test:
+    needs: plan
+    name: rules-test (${{ matrix.target.ref || matrix.target.version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Look for rules
+        id: rules
+        run: |
+          if [ -n "$(find . \( -path ./lib -o -path './.*' \) -prune -o -type f -name '*.rego' -print -quit)" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No rules outside lib/; skipping yata rules test."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: ./.github/actions/setup-yata
+        if: steps.rules.outputs.found == 'true'
+        with:
+          ref: ${{ matrix.target.ref }}
+          version: ${{ matrix.target.version }}
+      - name: Show yata version
+        if: steps.rules.outputs.found == 'true'
+        run: yata --version
+      - name: Run yata rules test
+        if: steps.rules.outputs.found == 'true'
+        run: yata rules test --policy-dir . --format text
+
+  rules-test-result:
+    needs: rules-test
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check rules-test result
+        env:
+          RESULT: ${{ needs.rules-test.result }}
+        run: |
+          if [ "$RESULT" != "success" ]; then
+            echo "::error::rules-test finished with result: $RESULT"
+            exit 1
+          fi
