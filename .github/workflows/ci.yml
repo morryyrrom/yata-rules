@@ -19,7 +19,7 @@ permissions:
 env:
   # Empty, or the full SHA of a yata-cli commit. When set, CI builds yata from that commit.
   # Must be empty in release pull requests.
-  YATA_CLI_REF: 12f0a093082a5584e4d3e9e215a13c1d8367e1e3
+  YATA_CLI_REF: ""
 
 jobs:
   lint:
