@@ -1,0 +1,68 @@
+name: Set up yata
+description: >-
+  Provides the yata CLI on PATH, either built from a yata-cli commit (`ref`)
+  or from a yata-cli release (`version`). Pass exactly one of them.
+
+inputs:
+  ref:
+    description: Full SHA of a yata-cli commit to build from source.
+    required: false
+    default: ""
+  version:
+    description: yata-cli release version (x.y.z) to download.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Check inputs
+      shell: bash
+      env:
+        INPUT_REF: ${{ inputs.ref }}
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        if [ -n "$INPUT_REF" ] && [ -n "$INPUT_VERSION" ]; then
+          echo "::error::Pass either ref or version to setup-yata, not both."
+          exit 1
+        fi
+        if [ -z "$INPUT_REF" ] && [ -z "$INPUT_VERSION" ]; then
+          echo "::error::Pass ref or version to setup-yata."
+          exit 1
+        fi
+        if [ -n "$INPUT_VERSION" ]; then
+          # The yata-cli release layout (asset names, tags, checksums) is undecided.
+          echo "::error::There is no path for yata-cli release binaries yet. Set YATA_CLI_REF in .github/workflows/ci.yml."
+          exit 1
+        fi
+        if ! printf '%s\n' "$INPUT_REF" | grep -Eq '^[0-9a-f]{40}$'; then
+          echo "::error::ref must be a full 40-character commit SHA."
+          exit 1
+        fi
+
+    - name: Restore cached yata
+      id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.yata-ci/bin/yata
+        key: yata-${{ runner.os }}-${{ inputs.ref }}
+
+    - name: Build yata from source
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        INPUT_REF: ${{ inputs.ref }}
+      run: |
+        src="$RUNNER_TEMP/yata-cli"
+        git clone --filter=blob:none https://github.com/morryyrrom/yata-cli.git "$src"
+        git -C "$src" checkout "$INPUT_REF"
+        cd "$src"
+        # Installs the toolchain pinned in yata-cli's rust-toolchain.toml.
+        rustup toolchain install
+        cargo build --release --locked -p yata-cli
+        mkdir -p "$HOME/.yata-ci/bin"
+        cp target/release/yata "$HOME/.yata-ci/bin/yata"
+
+    - name: Add yata to PATH
+      shell: bash
+      run: echo "$HOME/.yata-ci/bin" >> "$GITHUB_PATH"

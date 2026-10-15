@@ -1,0 +1,174 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Trial run to check workflow changes: runs up to `package` and creates no release.
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify release
+        id: verify
+        run: |
+          version="$(jq -r .version yata-policies.json)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" != "push" ]; then
+            echo "::notice::Trial run ($GITHUB_EVENT_NAME); skipping tag, branch, changelog and YATA_CLI_REF checks."
+            exit 0
+          fi
+          status=0
+          tag="$GITHUB_REF_NAME"
+          if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Tag $tag must match v<major>.<minor>.<patch>."
+            status=1
+          fi
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::Tag $tag does not match version $version in yata-policies.json."
+            status=1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::The tagged commit is not on main."
+            status=1
+          fi
+          if ! grep -q "^## \[${version//./\\.}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no \"## [$version]\" section."
+            status=1
+          fi
+          leftover="$(find changelog.d -type f ! -path changelog.d/README.md)"
+          if [ -n "$leftover" ]; then
+            echo "::error::Changelog fragments are left in changelog.d/: $leftover"
+            status=1
+          fi
+          ref="$(yq '.env.YATA_CLI_REF // ""' .github/workflows/ci.yml)"
+          if [ -n "$ref" ]; then
+            echo "::error::YATA_CLI_REF in .github/workflows/ci.yml must be empty for a release."
+            status=1
+          fi
+          exit "$status"
+
+  ci:
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+    with:
+      yata-mode: ${{ github.event_name == 'push' && 'release' || 'ci' }}
+
+  package:
+    needs: [verify, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build archives
+        run: |
+          mkdir -p dist
+          git archive --format=tar.gz --prefix="yata-rules-$VERSION/" -o "dist/yata-rules-$VERSION.tar.gz" HEAD
+          git archive --format=zip --prefix="yata-rules-$VERSION/" -o "dist/yata-rules-$VERSION.zip" HEAD
+          cd dist
+          sha256sum "yata-rules-$VERSION.tar.gz" "yata-rules-$VERSION.zip" > SHA256SUMS
+          cat SHA256SUMS
+      - name: Extract archive
+        id: extract
+        run: |
+          dir="$RUNNER_TEMP/extract"
+          mkdir -p "$dir"
+          tar -xzf "dist/yata-rules-$VERSION.tar.gz" -C "$dir"
+          root="$dir/yata-rules-$VERSION"
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+          (cd "$root" && find . -type f | LC_ALL=C sort)
+          if [ -n "$(cd "$root" && find . \( -path ./lib -o -path './.*' \) -prune -o -type f -name '*.rego' -print -quit)" ]; then
+            echo "rules=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No rules outside lib/; skipping yata rules test on the archive."
+            echo "rules=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Choose yata
+        id: yata
+        if: steps.extract.outputs.rules == 'true'
+        run: |
+          # Same rule as the `plan` job in ci.yml. For tag pushes, `verify` ensures YATA_CLI_REF is empty.
+          ref="$(yq '.env.YATA_CLI_REF // ""' .github/workflows/ci.yml)"
+          if [ -n "$ref" ]; then
+            echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(jq -r .min_yata_version yata-policies.json)" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: ./.github/actions/setup-yata
+        if: steps.extract.outputs.rules == 'true'
+        with:
+          ref: ${{ steps.yata.outputs.ref }}
+          version: ${{ steps.yata.outputs.version }}
+      - name: Test the archive
+        if: steps.extract.outputs.rules == 'true'
+        env:
+          POLICY_ROOT: ${{ steps.extract.outputs.root }}
+        run: |
+          yata --version
+          yata rules test --policy-dir "$POLICY_ROOT" --format text
+      - name: Write release notes
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            # The body of the "## [<version>]" section, up to the next "## " heading.
+            awk -v heading="## [$VERSION]" '
+              index($0, heading) == 1 { in_section = 1; next }
+              in_section && /^## / { exit }
+              in_section { print }
+            ' CHANGELOG.md > dist/notes.md
+          else
+            : > dist/notes.md
+            find changelog.d -maxdepth 1 -type f -name '*.md' ! -name README.md -print0 \
+              | LC_ALL=C sort -z \
+              | xargs -0 -r cat >> dist/notes.md
+          fi
+          cat dist/notes.md
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [verify, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: Create draft release
+        working-directory: dist
+        run: |
+          gh release create "v$VERSION" --draft --verify-tag \
+            --title "yata-rules $VERSION" \
+            --notes-file notes.md \
+            "yata-rules-$VERSION.tar.gz" "yata-rules-$VERSION.zip" SHA256SUMS
+      - name: Publish release
+        run: gh release edit "v$VERSION" --draft=false
